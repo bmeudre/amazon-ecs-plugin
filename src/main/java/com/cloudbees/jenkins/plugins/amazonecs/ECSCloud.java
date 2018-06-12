@@ -25,13 +25,11 @@
 
 package com.cloudbees.jenkins.plugins.amazonecs;
 
+import java.io.FileNotFoundException;
+import java.io.FileReader;
 import java.io.IOException;
 import java.text.MessageFormat;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.Date;
-import java.util.List;
+import java.util.*;
 import java.util.concurrent.Callable;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -41,7 +39,10 @@ import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 import javax.servlet.ServletException;
 
+import com.amazonaws.services.ec2.model.DescribeInstancesRequest;
+import com.amazonaws.services.ecs.model.DescribeContainerInstancesRequest;
 import com.amazonaws.services.ecs.model.TaskDefinition;
+import com.sun.org.apache.xpath.internal.operations.Bool;
 import org.apache.commons.lang.StringUtils;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.DataBoundSetter;
@@ -69,6 +70,11 @@ import hudson.util.FormValidation;
 import hudson.util.ListBoxModel;
 import jenkins.model.Jenkins;
 import jenkins.model.JenkinsLocationConfiguration;
+
+import org.json.simple.JSONArray;
+import org.json.simple.JSONObject;
+import org.json.simple.parser.JSONParser;
+import org.json.simple.parser.ParseException;
 
 /**
  * @author <a href="mailto:nicolas.deloof@gmail.com">Nicolas De Loof</a>
@@ -99,27 +105,32 @@ public class ECSCloud extends Cloud {
 
     private String jenkinsUrl;
 
+    private boolean localEcsMaster;
+
     private int slaveTimoutInSeconds;
 
     private ECSService ecsService;
 
+    private EC2Service ec2Service;
+
     @DataBoundConstructor
     public ECSCloud(String name, List<ECSTaskTemplate> templates, @Nonnull String credentialsId,
-            String cluster, String regionName, String jenkinsUrl, int slaveTimoutInSeconds) throws InterruptedException{
+                    String cluster, String regionName, String jenkinsUrl, int slaveTimoutInSeconds, boolean localEcsMaster) throws InterruptedException {
         super(name);
         this.credentialsId = credentialsId;
         this.cluster = cluster;
         this.templates = templates;
         this.regionName = regionName;
+        this.localEcsMaster = localEcsMaster;
         LOGGER.log(Level.INFO, "Create cloud {0} on ECS cluster {1} on the region {2}", new Object[]{name, cluster, regionName});
 
-        if(StringUtils.isNotBlank(jenkinsUrl)) {
+        if (StringUtils.isNotBlank(jenkinsUrl)) {
             this.jenkinsUrl = jenkinsUrl;
         } else {
             this.jenkinsUrl = JenkinsLocationConfiguration.get().getUrl();
         }
 
-        if(slaveTimoutInSeconds > 0) {
+        if (slaveTimoutInSeconds > 0) {
             this.slaveTimoutInSeconds = slaveTimoutInSeconds;
         } else {
             this.slaveTimoutInSeconds = DEFAULT_SLAVE_TIMEOUT;
@@ -133,13 +144,20 @@ public class ECSCloud extends Cloud {
         return ecsService;
     }
 
+    synchronized EC2Service getEc2Service() {
+        if (ec2Service == null) {
+            ec2Service = new EC2Service(credentialsId, regionName);
+        }
+        return ec2Service;
+    }
+
     AmazonECSClient getAmazonECSClient() {
         return getEcsService().getAmazonECSClient();
     }
 
     @Nonnull
     public List<ECSTaskTemplate> getTemplates() {
-        return templates != null ? templates : Collections.<ECSTaskTemplate> emptyList();
+        return templates != null ? templates : Collections.<ECSTaskTemplate>emptyList();
     }
 
     public String getCredentialsId() {
@@ -193,16 +211,16 @@ public class ECSCloud extends Cloud {
     @Override
     public Collection<NodeProvisioner.PlannedNode> provision(Label label, int excessWorkload) {
         try {
-			LOGGER.log(Level.INFO, "Asked to provision {0} slave(s) for: {1}", new Object[]{excessWorkload, label});
+            LOGGER.log(Level.INFO, "Asked to provision {0} slave(s) for: {1}", new Object[]{excessWorkload, label});
 
             List<NodeProvisioner.PlannedNode> r = new ArrayList<NodeProvisioner.PlannedNode>();
             final ECSTaskTemplate template = getTemplate(label);
 
             for (int i = 1; i <= excessWorkload; i++) {
-				LOGGER.log(Level.INFO, "Will provision {0}, for label: {1}", new Object[]{template.getDisplayName(), label} );
+                LOGGER.log(Level.INFO, "Will provision {0}, for label: {1}", new Object[]{template.getDisplayName(), label});
 
                 r.add(new NodeProvisioner.PlannedNode(template.getDisplayName(), Computer.threadPoolForRemoting
-                  .submit(new ProvisioningCallback(template, label)), 1));
+                        .submit(new ProvisioningCallback(template, label)), 1));
             }
             return r;
         } catch (Exception e) {
@@ -211,7 +229,7 @@ public class ECSCloud extends Cloud {
         }
     }
 
-     void deleteTask(String taskArn, String clusterArn) {
+    void deleteTask(String taskArn, String clusterArn) {
         getEcsService().deleteTask(taskArn, clusterArn);
     }
 
@@ -242,7 +260,7 @@ public class ECSCloud extends Cloud {
             Date timeout = new Date(now.getTime() + 1000 * slaveTimoutInSeconds);
 
             synchronized (cluster) {
-                if (!template.isFargate()){
+                if (!template.isFargate()) {
                     getEcsService().waitForSufficientClusterResources(timeout, template, cluster);
                 }
 
@@ -277,7 +295,7 @@ public class ECSCloud extends Cloud {
 
                     String taskArn = getEcsService().runEcsTask(slave, template, cluster, getDockerRunCommand(slave), taskDefinition);
                     LOGGER.log(Level.INFO, "Slave {0} - Slave Task Started : {1}",
-                            new Object[] { slave.getNodeName(), taskArn });
+                            new Object[]{slave.getNodeName(), taskArn});
                     slave.setTaskArn(taskArn);
                 } catch (Exception ex) {
                     LOGGER.log(Level.WARNING, "Slave {0} - Cannot create ECS Task");
@@ -296,7 +314,7 @@ public class ECSCloud extends Cloud {
                     break;
                 }
                 LOGGER.log(Level.FINE, "Waiting for slave {0} (ecs task {1}) to connect since {2}.",
-                        new Object[] { slave.getNodeName(), slave.getTaskArn(), now });
+                        new Object[]{slave.getNodeName(), slave.getTaskArn(), now});
                 Thread.sleep(1000);
             }
             if (!slave.getComputer().isOnline()) {
@@ -316,10 +334,47 @@ public class ECSCloud extends Cloud {
     private Collection<String> getDockerRunCommand(ECSSlave slave) {
         Collection<String> command = new ArrayList<String>();
         command.add("-url");
-        command.add(jenkinsUrl);
-        if (StringUtils.isNotBlank(tunnel)) {
+        if (localEcsMaster) {
+
+            JSONParser parser = new JSONParser();
+            JSONObject data = null;
+            try {
+                data = (JSONObject) parser.parse(new FileReader(System.getenv("ECS_CONTAINER_METADATA_FILE")));
+            } catch (ParseException e) {
+                LOGGER.log(Level.INFO, e.getMessage());
+            } catch (FileNotFoundException e) {
+                LOGGER.log(Level.INFO, e.getMessage());
+            } catch (IOException e) {
+                LOGGER.log(Level.INFO, e.getMessage());
+            }
+
+            String containerInstanceArn = (String) data.get("ContainerInstanceARN");
+            JSONArray portMappings = (JSONArray) data.get("PortMappings");
+            HashMap<Long, Long> ports = new HashMap<Long, Long>();
+
+            for (Object o : portMappings) {
+                JSONObject portMapping = (JSONObject) o;
+                ports.put((Long) portMapping.get("ContainerPort"), (Long) portMapping.get("HostPort"));
+            }
+
+            String ec2InstanceID = getEcsService().getAmazonECSClient().describeContainerInstances(
+                    new DescribeContainerInstancesRequest().withCluster(cluster).withContainerInstances(containerInstanceArn)
+            ).getContainerInstances().get(0).getEc2InstanceId();
+
+            String privateIpAddress = getEc2Service().getAmazonEC2Client().describeInstances(
+                    new DescribeInstancesRequest().withInstanceIds(ec2InstanceID)
+            ).getReservations().get(0).getInstances().get(0).getPrivateIpAddress();
+
+            command.add("http://" + privateIpAddress + ":" + ports.get(8080L));
             command.add("-tunnel");
-            command.add(tunnel);
+            command.add(privateIpAddress + ":" + ports.get(50000L));
+
+        } else {
+            command.add(jenkinsUrl);
+            if (StringUtils.isNotBlank(tunnel)) {
+                command.add("-tunnel");
+                command.add(tunnel);
+            }
         }
         command.add(slave.getComputer().getJnlpMac());
         command.add(slave.getComputer().getName());
@@ -384,6 +439,21 @@ public class ECSCloud extends Cloud {
             return FormValidation.error("Up to 127 letters (uppercase and lowercase), numbers, hyphens, and underscores are allowed");
         }
 
+        public FormValidation doCheckLocalEcsMaster(@QueryParameter boolean value) throws IOException, ServletException {
+            if (!value) return FormValidation.ok();
+
+            JSONParser parser = new JSONParser();
+            JSONObject data = null;
+            try {
+                data = (JSONObject) parser.parse(new FileReader(System.getenv("ECS_CONTAINER_METADATA_FILE")));
+            } catch (ParseException e) {
+                LOGGER.log(Level.INFO, e.getMessage());
+                return FormValidation.error("Can't find ECS container metadata file, check that the environment variable ECS_CONTAINER_METADATA_FILE is defined");
+            }
+
+            return FormValidation.ok();
+        }
+
     }
 
     public static Region getRegion(String regionName) {
@@ -400,5 +470,13 @@ public class ECSCloud extends Cloud {
 
     public void setJenkinsUrl(String jenkinsUrl) {
         this.jenkinsUrl = jenkinsUrl;
+    }
+
+    public boolean isLocalEcsMaster() {
+        return localEcsMaster;
+    }
+
+    public void setLocalEcsMaster(boolean localEcsMaster) {
+        this.localEcsMaster = localEcsMaster;
     }
 }
