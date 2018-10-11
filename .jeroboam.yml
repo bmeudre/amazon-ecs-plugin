@@ -1,0 +1,12 @@
+cache:
+  paths:
+    - .m2/repository
+
+variables:
+  MAVEN_OPTS: "-Dmaven.repo.local=/container/.m2/repository"
+
+build:
+  script:
+    - java -version
+    - mvn -version
+    - mvn clean install
