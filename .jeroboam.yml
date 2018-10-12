@@ -7,6 +7,7 @@ variables:
 
 build:
   image: maven:3.5-jdk-8-alpine
+  cores: 2
   script:
     - java -version
     - mvn -version
